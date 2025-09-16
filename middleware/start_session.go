@@ -39,6 +39,10 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 			s.Start()
 			r = r.WithContext(context.WithValue(r.Context(), sessions.CtxKey, s)) //nolint:staticcheck
 
+			// Continue processing request
+			writer := newResponseWriter(w)
+			next.ServeHTTP(writer, r)
+
 			// Check whether we need to reset session Cookie if session ID has changed
 			if s.GetID() != sessionID {
 				// Set session cookie in response
@@ -48,18 +52,17 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 					Expires:  time.Now().Add(time.Duration(manager.Lifetime) * time.Minute),
 					Path:     "/",
 					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
 				})
 			}
-
-			// Continue processing request
-			next.ServeHTTP(w, r)
 
 			// Save session
 			if err = s.Save(); err != nil {
 				log.Printf("session save error: %v", err)
 			}
 
-			// Release session
+			// Flush response and release session
+			writer.flush()
 			manager.ReleaseSession(s)
 		})
 	}
