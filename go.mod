@@ -6,7 +6,7 @@ require (
 	github.com/jaevor/go-nanoid v1.4.0
 	github.com/libtnb/securecookie v1.2.0
 	github.com/libtnb/utils v1.2.0
-	github.com/spf13/cast v1.9.2
+	github.com/spf13/cast v1.10.0
 )
 
 require (
