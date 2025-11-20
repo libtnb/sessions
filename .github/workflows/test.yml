@@ -11,7 +11,7 @@ jobs:
         go: [ "oldstable", "stable" ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
@@ -34,7 +34,7 @@ jobs:
         go: [ "oldstable", "stable" ]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
@@ -57,7 +57,7 @@ jobs:
         go: [ "oldstable", "stable" ]
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
