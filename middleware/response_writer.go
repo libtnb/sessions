@@ -10,9 +10,10 @@ import (
 // responseWriter is an http.ResponseWriter wrapper that captures the response body and status code.
 type responseWriter struct {
 	http.ResponseWriter
-	body       *bytes.Buffer
-	statusCode int
-	written    bool
+	body        *bytes.Buffer
+	statusCode  int
+	written     bool
+	passthrough bool
 }
 
 func newResponseWriter(w http.ResponseWriter) *responseWriter {
@@ -27,14 +28,26 @@ func (w *responseWriter) WriteHeader(code int) {
 	if !w.written {
 		w.statusCode = code
 		w.written = true
+
+		if code < http.StatusOK {
+			// For status codes < 200, switch to passthrough mode
+			w.passthrough = true
+			w.ResponseWriter.WriteHeader(code)
+		}
 	}
 }
 
 func (w *responseWriter) Write(data []byte) (int, error) {
+	if w.passthrough {
+		return w.ResponseWriter.Write(data)
+	}
 	return w.body.Write(data)
 }
 
 func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if !w.passthrough && w.body.Len() > 0 {
+		w.flush()
+	}
 	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return hijacker.Hijack()
 	}
@@ -42,15 +55,19 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 func (w *responseWriter) Flush() {
-	w.flush()
+	if !w.passthrough {
+		w.flush()
+	}
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
 }
 
 func (w *responseWriter) flush() {
-	if w.written {
+	if w.written && !w.passthrough {
 		w.ResponseWriter.WriteHeader(w.statusCode)
 	}
-	_, _ = w.ResponseWriter.Write(w.body.Bytes())
+	if !w.passthrough {
+		_, _ = w.ResponseWriter.Write(w.body.Bytes())
+	}
 }

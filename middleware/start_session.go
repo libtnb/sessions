@@ -62,7 +62,7 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 			}
 
 			// Flush response and release session
-			writer.flush()
+			writer.Flush()
 			manager.ReleaseSession(s)
 		})
 	}
