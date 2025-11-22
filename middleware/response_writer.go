@@ -57,9 +57,10 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *responseWriter) Flush() {
 	if !w.passthrough {
 		w.flush()
-	}
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
+	} else {
+		if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
 	}
 }
 
