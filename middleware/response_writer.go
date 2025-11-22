@@ -46,7 +46,7 @@ func (w *responseWriter) Write(data []byte) (int, error) {
 
 func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !w.passthrough && w.body.Len() > 0 {
-		w.flush()
+		w.Flush()
 	}
 	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return hijacker.Hijack()
@@ -56,19 +56,15 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (w *responseWriter) Flush() {
 	if !w.passthrough {
-		w.flush()
-	} else {
+		if w.written && !w.passthrough {
+			w.ResponseWriter.WriteHeader(w.statusCode)
+		}
+		if !w.passthrough {
+			_, _ = w.ResponseWriter.Write(w.body.Bytes())
+		}
 		if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 			flusher.Flush()
 		}
 	}
-}
 
-func (w *responseWriter) flush() {
-	if w.written && !w.passthrough {
-		w.ResponseWriter.WriteHeader(w.statusCode)
-	}
-	if !w.passthrough {
-		_, _ = w.ResponseWriter.Write(w.body.Bytes())
-	}
 }
