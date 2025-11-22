@@ -14,6 +14,7 @@ type responseWriter struct {
 	statusCode  int
 	written     bool
 	passthrough bool
+	hijacked    bool
 }
 
 func newResponseWriter(w http.ResponseWriter) *responseWriter {
@@ -49,6 +50,7 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		w.Flush()
 	}
 	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
+		w.hijacked = true
 		return hijacker.Hijack()
 	}
 	panic("ResponseWriter doesn't implement http.Hijacker")
@@ -56,15 +58,14 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (w *responseWriter) Flush() {
 	if !w.passthrough {
-		if w.written && !w.passthrough {
+		if w.written {
 			w.ResponseWriter.WriteHeader(w.statusCode)
 		}
-		if !w.passthrough {
-			_, _ = w.ResponseWriter.Write(w.body.Bytes())
-		}
+		_, _ = w.ResponseWriter.Write(w.body.Bytes())
+	}
+	if !w.hijacked {
 		if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 			flusher.Flush()
 		}
 	}
-
 }
