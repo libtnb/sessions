@@ -5,11 +5,12 @@ on:
       - main
   pull_request:
 jobs:
-  ubuntu:
+  test:
     strategy:
       matrix:
         go: [ "oldstable", "stable" ]
-    runs-on: ubuntu-latest
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -17,41 +18,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           cache: true
-          go-version: 'stable'
-      - name: Install dependencies
-        run: go mod tidy
-      - name: Run tests
-        run: go test -timeout 1h ./...
-  windows:
-    strategy:
-      matrix:
-        go: [ "oldstable", "stable" ]
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          cache: true
-          go-version: 'stable'
-      - name: Install dependencies
-        run: go mod tidy
-      - name: Run tests
-        run: go test -timeout 1h ./...
-  macos:
-    strategy:
-      matrix:
-        go: [ "oldstable", "stable" ]
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          cache: true
-          go-version: 'stable'
+          go-version: ${{ matrix.go }}
       - name: Install dependencies
         run: go mod tidy
       - name: Run tests
