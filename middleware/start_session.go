@@ -43,9 +43,11 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 			writer := newResponseWriter(w)
 			next.ServeHTTP(writer, r)
 
-			// Check whether we need to reset session Cookie if session ID has changed
-			if s.GetID() != sessionID {
-				// Set session cookie in response
+			// Save session (skipped internally if not dirty)
+			if err = s.Save(); err != nil {
+				log.Printf("session save error: %v", err)
+			} else if s.GetID() != sessionID {
+				// Set session cookie in response only after successful persistence.
 				http.SetCookie(w, &http.Cookie{
 					Name:     s.GetName(),
 					Value:    s.GetID(),
@@ -54,11 +56,6 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 					HttpOnly: true,
 					SameSite: http.SameSiteLaxMode,
 				})
-			}
-
-			// Save session (skipped internally if not dirty)
-			if err = s.Save(); err != nil {
-				log.Printf("session save error: %v", err)
 			}
 
 			// Flush response and release session

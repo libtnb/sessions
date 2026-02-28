@@ -29,12 +29,18 @@ type ManagerOptions struct {
 }
 
 type Manager struct {
-	Codec        securecookie.Codec
-	Lifetime     int
-	GcInterval   int
-	drivers      map[string]driver.Driver
-	sessionPool  sync.Pool
-	sessionLocks sync.Map // sessionID → *sync.Mutex
+	Codec          securecookie.Codec
+	Lifetime       int
+	GcInterval     int
+	drivers        map[string]driver.Driver
+	sessionPool    sync.Pool
+	sessionLocksMu sync.Mutex
+	sessionLocks   map[string]*sessionLock
+}
+
+type sessionLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // NewManager creates a new session manager.
@@ -47,10 +53,11 @@ func NewManager(option *ManagerOptions) (*Manager, error) {
 		return nil, err
 	}
 	manager := &Manager{
-		Codec:      codec,
-		Lifetime:   option.Lifetime,
-		GcInterval: option.GcInterval,
-		drivers:    make(map[string]driver.Driver),
+		Codec:        codec,
+		Lifetime:     option.Lifetime,
+		GcInterval:   option.GcInterval,
+		drivers:      make(map[string]driver.Driver),
+		sessionLocks: make(map[string]*sessionLock),
 		sessionPool: sync.Pool{New: func() any {
 			return &Session{
 				attributes: make(map[string]any),
@@ -123,14 +130,38 @@ func (m *Manager) ReleaseSession(session *Session) {
 
 // LockSession 对指定 session ID 加锁
 func (m *Manager) LockSession(id string) {
-	mu, _ := m.sessionLocks.LoadOrStore(id, &sync.Mutex{})
-	mu.(*sync.Mutex).Lock()
+	m.sessionLocksMu.Lock()
+	lock, ok := m.sessionLocks[id]
+	if !ok {
+		lock = &sessionLock{}
+		m.sessionLocks[id] = lock
+	}
+	lock.refs++
+	m.sessionLocksMu.Unlock()
+
+	lock.mu.Lock()
 }
 
 // UnlockSession 释放指定 session ID 的锁
 func (m *Manager) UnlockSession(id string) {
-	if mu, ok := m.sessionLocks.Load(id); ok {
-		mu.(*sync.Mutex).Unlock()
+	m.sessionLocksMu.Lock()
+	lock, ok := m.sessionLocks[id]
+	if !ok {
+		m.sessionLocksMu.Unlock()
+		return
+	}
+	lock.refs--
+	shouldDelete := lock.refs == 0
+	m.sessionLocksMu.Unlock()
+
+	lock.mu.Unlock()
+
+	if shouldDelete {
+		m.sessionLocksMu.Lock()
+		if current, ok := m.sessionLocks[id]; ok && current == lock && lock.refs == 0 {
+			delete(m.sessionLocks, id)
+		}
+		m.sessionLocksMu.Unlock()
 	}
 }
 

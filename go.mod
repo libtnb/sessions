@@ -11,6 +11,6 @@ require (
 
 require (
 	github.com/gabriel-vasile/mimetype v1.4.10 // indirect
-	golang.org/x/crypto v0.43.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
 )
