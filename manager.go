@@ -29,11 +29,12 @@ type ManagerOptions struct {
 }
 
 type Manager struct {
-	Codec       securecookie.Codec
-	Lifetime    int
-	GcInterval  int
-	drivers     map[string]driver.Driver
-	sessionPool sync.Pool
+	Codec        securecookie.Codec
+	Lifetime     int
+	GcInterval   int
+	drivers      map[string]driver.Driver
+	sessionPool  sync.Pool
+	sessionLocks sync.Map // sessionID → *sync.Mutex
 }
 
 // NewManager creates a new session manager.
@@ -53,6 +54,8 @@ func NewManager(option *ManagerOptions) (*Manager, error) {
 		sessionPool: sync.Pool{New: func() any {
 			return &Session{
 				attributes: make(map[string]any),
+				puts:       make(map[string]any),
+				forgets:    make(map[string]bool),
 			}
 		},
 		},
@@ -75,6 +78,7 @@ func (m *Manager) BuildSession(name string, driver ...string) (*Session, error) 
 	session.name = name
 	session.codec = m.Codec
 	session.driver = handler
+	session.manager = m
 
 	return session, nil
 }
@@ -115,6 +119,19 @@ func (m *Manager) AcquireSession() *Session {
 func (m *Manager) ReleaseSession(session *Session) {
 	session.reset()
 	m.sessionPool.Put(session)
+}
+
+// LockSession 对指定 session ID 加锁
+func (m *Manager) LockSession(id string) {
+	mu, _ := m.sessionLocks.LoadOrStore(id, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+}
+
+// UnlockSession 释放指定 session ID 的锁
+func (m *Manager) UnlockSession(id string) {
+	if mu, ok := m.sessionLocks.Load(id); ok {
+		mu.(*sync.Mutex).Unlock()
+	}
 }
 
 func (m *Manager) driver(name ...string) (driver.Driver, error) {

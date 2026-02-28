@@ -56,7 +56,7 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 				})
 			}
 
-			// Save session
+			// Save session (skipped internally if not dirty)
 			if err = s.Save(); err != nil {
 				log.Printf("session save error: %v", err)
 			}
