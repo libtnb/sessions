@@ -10,6 +10,7 @@ import (
 type memoryDriver struct {
 	mu        sync.Mutex
 	data      map[string]string
+	writes    int
 	failWrite bool
 }
 
@@ -51,6 +52,7 @@ func (d *memoryDriver) Write(id string, data string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.data[id] = data
+	d.writes++
 	return nil
 }
 
@@ -124,6 +126,67 @@ func TestSessionSaveMergesConcurrentWrites(t *testing.T) {
 		}
 	}
 	manager.ReleaseSession(result)
+}
+
+func TestSessionSaveWritesWhenNotDirty(t *testing.T) {
+	d := newMemoryDriver()
+	manager := testManagerWithDriver(t, d)
+
+	// Create and save a session with some data
+	s1, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	s1.Start()
+	s1.Put("key", "value")
+	if err = s1.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	sessionID := s1.GetID()
+	manager.ReleaseSession(s1)
+
+	// Record writes after initial save
+	d.mu.Lock()
+	writesBefore := d.writes
+	d.mu.Unlock()
+
+	// Open the same session but don't modify it
+	s2, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	s2.SetID(sessionID)
+	s2.Start()
+
+	if got := s2.Get("key"); got != "value" {
+		t.Fatalf("expected 'value', got %v", got)
+	}
+
+	// Save without modifications — should still write to refresh timestamp
+	if err = s2.Save(); err != nil {
+		t.Fatalf("Save (non-dirty) failed: %v", err)
+	}
+	manager.ReleaseSession(s2)
+
+	d.mu.Lock()
+	writesAfter := d.writes
+	d.mu.Unlock()
+
+	if writesAfter <= writesBefore {
+		t.Fatal("expected driver.Write to be called for non-dirty session to refresh timestamp")
+	}
+
+	// Verify the session data is still intact
+	s3, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	s3.SetID(sessionID)
+	s3.Start()
+	if got := s3.Get("key"); got != "value" {
+		t.Fatalf("expected 'value' after non-dirty save, got %v", got)
+	}
+	manager.ReleaseSession(s3)
 }
 
 func TestManagerSessionLocksAreCleanedUp(t *testing.T) {
