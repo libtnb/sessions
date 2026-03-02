@@ -149,14 +149,22 @@ func (s *Session) Remove(key string) any {
 func (s *Session) Save() error {
 	s.ageFlashData()
 
-	if !s.dirty {
-		return nil
-	}
-
-	// 短暂加锁，仅在合并写入期间持有
+	// 短暂加锁，仅在读写期间持有
 	if s.manager != nil {
 		s.manager.LockSession(s.GetID())
 		defer s.manager.UnlockSession(s.GetID())
+	}
+
+	if !s.dirty {
+		// 数据无变更，仍需写回以刷新时间戳，防止 GC 误清理活跃 session
+		value, err := s.driver.Read(s.GetID())
+		if err != nil {
+			// session 在 store 中尚不存在，无需刷新
+			s.started = false
+			return nil
+		}
+		s.started = false
+		return s.driver.Write(s.GetID(), value)
 	}
 
 	var final map[string]any
