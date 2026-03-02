@@ -156,15 +156,10 @@ func (s *Session) Save() error {
 	}
 
 	if !s.dirty {
-		// 数据无变更，仍需写回以刷新时间戳，防止 GC 误清理活跃 session
-		value, err := s.driver.Read(s.GetID())
-		if err != nil {
-			// session 在 store 中尚不存在，无需刷新
-			s.started = false
-			return nil
-		}
+		// 数据无变更，仅刷新时间戳，防止 GC 误清理活跃 session
+		_ = s.driver.Touch(s.GetID())
 		s.started = false
-		return s.driver.Write(s.GetID(), value)
+		return nil
 	}
 
 	var final map[string]any

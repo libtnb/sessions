@@ -38,6 +38,15 @@ func (d *memoryDriver) Gc(int) error {
 	return nil
 }
 
+func (d *memoryDriver) Touch(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.data[id]; !ok {
+		return fmt.Errorf("session [%s] not found", id)
+	}
+	return nil
+}
+
 func (d *memoryDriver) Read(id string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -10,6 +10,8 @@ type Driver interface {
 	Gc(maxLifetime int) error
 	// Read reads the session data associated with the given ID.
 	Read(id string) (string, error)
+	// Touch refreshes the session's last access time without reading or writing data.
+	Touch(id string) error
 	// Write writes the session data associated with the given ID.
 	Write(id string, data string) error
 }

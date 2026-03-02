@@ -60,6 +60,19 @@ func (f *File) Gc(maxLifetime int) error {
 	})
 }
 
+func (f *File) Touch(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	path := f.getFilePath(id)
+	if !file.Exists(path) {
+		return fmt.Errorf("session [%s] not found", id)
+	}
+
+	now := time.Now()
+	return os.Chtimes(path, now, now)
+}
+
 func (f *File) Read(id string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

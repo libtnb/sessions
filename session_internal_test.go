@@ -11,6 +11,7 @@ type memoryDriver struct {
 	mu        sync.Mutex
 	data      map[string]string
 	writes    int
+	touches   int
 	failWrite bool
 }
 
@@ -32,6 +33,16 @@ func (d *memoryDriver) Destroy(id string) error {
 }
 
 func (d *memoryDriver) Gc(int) error {
+	return nil
+}
+
+func (d *memoryDriver) Touch(id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.data[id]; !ok {
+		return fmt.Errorf("session [%s] not found", id)
+	}
+	d.touches++
 	return nil
 }
 
@@ -128,7 +139,7 @@ func TestSessionSaveMergesConcurrentWrites(t *testing.T) {
 	manager.ReleaseSession(result)
 }
 
-func TestSessionSaveWritesWhenNotDirty(t *testing.T) {
+func TestSessionSaveTouchesWhenNotDirty(t *testing.T) {
 	d := newMemoryDriver()
 	manager := testManagerWithDriver(t, d)
 
@@ -145,9 +156,9 @@ func TestSessionSaveWritesWhenNotDirty(t *testing.T) {
 	sessionID := s1.GetID()
 	manager.ReleaseSession(s1)
 
-	// Record writes after initial save
+	// Record touches after initial save
 	d.mu.Lock()
-	writesBefore := d.writes
+	touchesBefore := d.touches
 	d.mu.Unlock()
 
 	// Open the same session but don't modify it
@@ -162,18 +173,18 @@ func TestSessionSaveWritesWhenNotDirty(t *testing.T) {
 		t.Fatalf("expected 'value', got %v", got)
 	}
 
-	// Save without modifications — should still write to refresh timestamp
+	// Save without modifications — should call Touch to refresh timestamp
 	if err = s2.Save(); err != nil {
 		t.Fatalf("Save (non-dirty) failed: %v", err)
 	}
 	manager.ReleaseSession(s2)
 
 	d.mu.Lock()
-	writesAfter := d.writes
+	touchesAfter := d.touches
 	d.mu.Unlock()
 
-	if writesAfter <= writesBefore {
-		t.Fatal("expected driver.Write to be called for non-dirty session to refresh timestamp")
+	if touchesAfter <= touchesBefore {
+		t.Fatal("expected driver.Touch to be called for non-dirty session to refresh timestamp")
 	}
 
 	// Verify the session data is still intact
