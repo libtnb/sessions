@@ -100,7 +100,7 @@ func (s *Session) Keep(keys ...string) *Session {
 }
 
 func (s *Session) Missing(key string) bool {
-	return !s.Exists(key)
+	return !s.Has(key)
 }
 
 func (s *Session) Now(key string, value any) *Session {
@@ -212,7 +212,9 @@ func (s *Session) SetName(name string) *Session {
 }
 
 func (s *Session) Start() bool {
-	s.loadSession()
+	if !s.loadSession() {
+		s.id = s.generateSessionID()
+	}
 	s.started = true
 	return s.started
 }
@@ -228,14 +230,27 @@ func (s *Session) generateSessionID() string {
 }
 
 func (s *Session) isValidID(id string) bool {
-	return len(id) == 32
+	if len(id) != 32 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= '0' && c <= '9') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= 'a' && c <= 'z')) {
+			return false
+		}
+	}
+	return true
 }
 
-func (s *Session) loadSession() {
+func (s *Session) loadSession() bool {
 	data := s.readFromHandler()
-	if data != nil {
-		stdmaps.Copy(s.attributes, data)
+	if data == nil {
+		return false
 	}
+	stdmaps.Copy(s.attributes, data)
+	return true
 }
 
 func (s *Session) migrate(destroy ...bool) error {

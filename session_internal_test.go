@@ -200,6 +200,56 @@ func TestSessionSaveTouchesWhenNotDirty(t *testing.T) {
 	manager.ReleaseSession(s3)
 }
 
+func TestSessionRejectsUnsafeID(t *testing.T) {
+	manager := testManagerWithDriver(t, newMemoryDriver())
+	session, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	defer manager.ReleaseSession(session)
+
+	session.SetID("../12345678901234567890123456789")
+	if got := session.GetID(); got == "../12345678901234567890123456789" {
+		t.Fatal("expected unsafe session id to be rejected")
+	}
+	if len(session.GetID()) != 32 {
+		t.Fatalf("expected regenerated session id length 32, got %q", session.GetID())
+	}
+}
+
+func TestSessionStartRegeneratesUnknownClientID(t *testing.T) {
+	driver := newMemoryDriver()
+	manager := testManagerWithDriver(t, driver)
+
+	session, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	unknownID := "12345678901234567890123456789012"
+	session.SetID(unknownID)
+	session.Start()
+	if got := session.GetID(); got == unknownID {
+		t.Fatal("expected unknown client-provided session id to be regenerated")
+	}
+	session.Put("key", "value")
+	if err = session.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	newID := session.GetID()
+	manager.ReleaseSession(session)
+
+	driver.mu.Lock()
+	_, oldExists := driver.data[unknownID]
+	_, newExists := driver.data[newID]
+	driver.mu.Unlock()
+	if oldExists {
+		t.Fatal("unknown client-provided session id was persisted")
+	}
+	if !newExists {
+		t.Fatal("regenerated session id was not persisted")
+	}
+}
+
 func TestManagerSessionLocksAreCleanedUp(t *testing.T) {
 	manager, err := NewManager(&ManagerOptions{
 		Key:                  "12345678901234567890123456789012",
