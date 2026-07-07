@@ -7,14 +7,19 @@ import (
 	"net/http"
 )
 
-// responseWriter is an http.ResponseWriter wrapper that captures the response body and status code.
+// responseWriter buffers the response so the session middleware can still
+// set headers (the session cookie) after the handler has run. beforeHeader,
+// when set, is invoked once, right before the header is sent to the
+// underlying writer — this is the last moment at which headers can change.
 type responseWriter struct {
 	http.ResponseWriter
-	body        *bytes.Buffer
-	statusCode  int
-	written     bool
-	passthrough bool
-	hijacked    bool
+	body         *bytes.Buffer
+	statusCode   int
+	written      bool // WriteHeader was called by the handler
+	headerSent   bool // header was flushed to the underlying writer
+	passthrough  bool
+	hijacked     bool
+	beforeHeader func()
 }
 
 func newResponseWriter(w http.ResponseWriter) *responseWriter {
@@ -25,16 +30,24 @@ func newResponseWriter(w http.ResponseWriter) *responseWriter {
 	}
 }
 
-func (w *responseWriter) WriteHeader(code int) {
-	if !w.written {
-		w.statusCode = code
-		w.written = true
+// Unwrap returns the underlying ResponseWriter so that
+// http.NewResponseController can reach deadline setters and similar
+// optional interfaces.
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
 
-		if code < http.StatusOK {
-			// For status codes < 200, switch to passthrough mode
-			w.passthrough = true
-			w.ResponseWriter.WriteHeader(code)
-		}
+func (w *responseWriter) WriteHeader(code int) {
+	if w.written || w.headerSent {
+		return
+	}
+	w.statusCode = code
+	w.written = true
+
+	if code < http.StatusOK {
+		// For status codes < 200, switch to passthrough mode
+		w.passthrough = true
+		w.ResponseWriter.WriteHeader(code)
 	}
 }
 
@@ -56,16 +69,28 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	panic("ResponseWriter doesn't implement http.Hijacker")
 }
 
+// Flush sends the buffered header and body to the underlying writer. It is
+// safe to call multiple times (e.g. by streaming handlers): the header goes
+// out once and the buffer is drained after each flush, so nothing is ever
+// written twice.
 func (w *responseWriter) Flush() {
+	if w.hijacked {
+		return
+	}
 	if !w.passthrough {
-		if w.written {
+		if !w.headerSent {
+			if w.beforeHeader != nil {
+				w.beforeHeader()
+			}
+			w.headerSent = true
 			w.ResponseWriter.WriteHeader(w.statusCode)
 		}
-		_, _ = w.ResponseWriter.Write(w.body.Bytes())
-	}
-	if !w.hijacked {
-		if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-			flusher.Flush()
+		if w.body.Len() > 0 {
+			_, _ = w.ResponseWriter.Write(w.body.Bytes())
+			w.body.Reset()
 		}
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
 	}
 }
