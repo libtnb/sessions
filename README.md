@@ -13,7 +13,7 @@ This package refers to the session module in [goravel/framework](https://github.
 - Concurrent requests to the same session merge key by key instead of overwriting each other
 - Flash data (`Flash`, `Now`, `Keep`, `Reflash`)
 - Sliding expiration: both the store timestamp and the cookie are refreshed on every request
-- Streaming-friendly middleware (SSE, chunked responses) with a buffered response writer
+- Middleware that never buffers the response: large downloads, SSE and WebSocket upgrades pass straight through
 - Session pooling to keep allocations low
 
 ## Installation
@@ -61,9 +61,15 @@ func main() {
 }
 ```
 
-The middleware starts the session, saves it after the handler returns (merging
-concurrent writes), and re-sends the cookie on every successful save so its
-expiry slides along with the server-side lifetime.
+The middleware starts the session and saves it right before the response
+header goes out (merging concurrent writes): on the handler's first
+`WriteHeader`, `Write` or `Flush`, or when it returns without writing. The
+cookie is re-sent on every successful save so its expiry slides along with
+the server-side lifetime.
+
+Change the session before writing the response. Data changed afterwards is
+still saved when the handler returns, but the cookie is already on its way:
+a session ID regenerated that late never reaches the client.
 
 ### Customizing the cookie
 
