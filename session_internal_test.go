@@ -398,6 +398,144 @@ func TestSessionKeepExtendsFlash(t *testing.T) {
 	manager.ReleaseSession(s3)
 }
 
+// request runs one request's worth of session work: it starts the session
+// with the given ID (a new one when empty), lets fn use it, and releases it.
+// fn is responsible for saving. It returns the session ID.
+func request(t *testing.T, manager *Manager, id string, fn func(s *Session)) string {
+	t.Helper()
+
+	s, err := manager.BuildSession(CookieName, "mock")
+	if err != nil {
+		t.Fatalf("BuildSession failed: %v", err)
+	}
+	defer manager.ReleaseSession(s)
+	if id != "" {
+		s.SetID(id)
+	}
+	s.Start()
+	fn(s)
+	return s.GetID()
+}
+
+func save(t *testing.T, s *Session) {
+	t.Helper()
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+}
+
+func TestSessionSaveTwiceAgesFlashOnce(t *testing.T) {
+	manager := testManagerWithDriver(t, newMemoryDriver())
+
+	// Saved before the response header goes out, then again for a change
+	// made afterwards.
+	id := request(t, manager, "", func(s *Session) {
+		s.Flash("msg", "hello")
+		save(t, s)
+		s.Put("late", "change")
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != "hello" {
+			t.Fatalf("flash value aged out by the second Save, got %v", got)
+		}
+		if got := s.Get("late"); got != "change" {
+			t.Fatalf("late change lost, got %v", got)
+		}
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != nil {
+			t.Fatalf("flash value should be aged out, got %v", got)
+		}
+	})
+}
+
+func TestSessionSaveLeavesFlashReadable(t *testing.T) {
+	manager := testManagerWithDriver(t, newMemoryDriver())
+
+	id := request(t, manager, "", func(s *Session) {
+		s.Flash("msg", "hello")
+		save(t, s)
+	})
+
+	// The handler keeps running after the save that precedes the header.
+	request(t, manager, id, func(s *Session) {
+		s.Now("now", "one-shot")
+		save(t, s)
+		if got := s.Get("msg"); got != "hello" {
+			t.Fatalf("flash value gone before the request ended, got %v", got)
+		}
+		if got := s.Get("now"); got != "one-shot" {
+			t.Fatalf("Now value gone before the request ended, got %v", got)
+		}
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != nil {
+			t.Fatalf("flash value should be aged out, got %v", got)
+		}
+		if got := s.Get("now"); got != nil {
+			t.Fatalf("Now value outlived its request, got %v", got)
+		}
+	})
+}
+
+func TestSessionFlashAfterSaveLastsOneRequest(t *testing.T) {
+	manager := testManagerWithDriver(t, newMemoryDriver())
+
+	id := request(t, manager, "", func(s *Session) {
+		save(t, s)
+		s.Flash("msg", "hello")
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != "hello" {
+			t.Fatalf("flash value not visible on next request, got %v", got)
+		}
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != nil {
+			t.Fatalf("flash value should be aged out, got %v", got)
+		}
+	})
+}
+
+func TestSessionKeepAfterSaveExtendsFlash(t *testing.T) {
+	manager := testManagerWithDriver(t, newMemoryDriver())
+
+	id := request(t, manager, "", func(s *Session) {
+		s.Flash("msg", "hello")
+		save(t, s)
+	})
+
+	// The first Save already dropped the value from the store.
+	request(t, manager, id, func(s *Session) {
+		save(t, s)
+		s.Keep("msg")
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != "hello" {
+			t.Fatalf("kept flash value should survive, got %v", got)
+		}
+		save(t, s)
+	})
+
+	request(t, manager, id, func(s *Session) {
+		if got := s.Get("msg"); got != nil {
+			t.Fatalf("flash value should be aged out, got %v", got)
+		}
+	})
+}
+
 func TestSessionPollutedFlashDataDoesNotPanic(t *testing.T) {
 	d := newMemoryDriver()
 	manager := testManagerWithDriver(t, d)

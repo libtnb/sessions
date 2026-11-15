@@ -30,11 +30,19 @@ func StartSession(manager *sessions.Manager, driver ...string) func(next http.Ha
 
 // StartSessionWithConfig is StartSession with explicit configuration.
 //
-// The session cookie is (re)sent on every response whose session was saved
-// successfully, so its expiry slides along with the server-side lifetime.
-// For streaming responses the session is saved right before the first byte
-// goes out; changes made after that are still persisted when the handler
-// returns, but can no longer affect the cookie.
+// The response is not buffered. The session is saved and its cookie (re)sent
+// right before the response header goes out: on the handler's first
+// WriteHeader, Write or Flush, or when it returns without having written
+// anything. The cookie is only sent when that save succeeded, so its expiry
+// slides along with the server-side lifetime.
+//
+// Changes made after the header went out are still persisted when the
+// handler returns, but can no longer affect the cookie. A session ID that is
+// regenerated that late cannot reach the client and is not stored. When the
+// save before the header fails, the session is not saved again.
+//
+// The first write reads the session, so it must not run concurrently with
+// changes to it.
 func StartSessionWithConfig(manager *sessions.Manager, cfg Config) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,21 +72,15 @@ func StartSessionWithConfig(manager *sessions.Manager, cfg Config) func(next htt
 			s.Start()
 			r = r.WithContext(context.WithValue(r.Context(), sessions.CtxKey, s)) //nolint:staticcheck
 
-			// saveAndSetCookie persists the session and, on success, (re)sends
-			// the session cookie so its expiry slides. It runs exactly once:
-			// either right before the first flush of a streaming response, or
-			// after the handler returns.
-			saved := false
+			// sentID is the session ID the cookie went out with; it stays
+			// empty when the session could not be saved.
+			var sentID string
 			saveAndSetCookie := func() {
-				if saved {
-					return
-				}
-				saved = true
-
 				if err := s.Save(); err != nil {
 					manager.Logger().Error("session save failed", "error", err)
 					return
 				}
+				sentID = s.GetID()
 
 				cookie := &http.Cookie{
 					Name:     s.GetName(),
@@ -97,24 +99,22 @@ func StartSessionWithConfig(manager *sessions.Manager, cfg Config) func(next htt
 			}
 
 			// Continue processing request
-			writer := newResponseWriter(w)
-			writer.beforeHeader = saveAndSetCookie
+			writer := &responseWriter{ResponseWriter: w, beforeHeader: saveAndSetCookie}
 			next.ServeHTTP(writer, r)
 
-			// Save session and set the cookie (no-op if a streaming flush
-			// already did it)
-			saveAndSetCookie()
-			if writer.headerSent && s.IsDirty() {
-				// The handler modified the session after the header went out
-				// (e.g. during a streaming response): persist the late
-				// changes; the cookie for this response is already fixed.
-				if err := s.Save(); err != nil {
-					manager.Logger().Error("session save failed", "error", err)
+			if !writer.commit() && sentID != "" {
+				// The header went out while the handler was still running:
+				// the cookie is fixed, only data can still be stored.
+				switch {
+				case s.GetID() != sentID:
+					manager.Logger().Error("session ID changed after the response header was sent, the client keeps the previous one")
+				case s.IsDirty():
+					if err := s.Save(); err != nil {
+						manager.Logger().Error("session save failed", "error", err)
+					}
 				}
 			}
 
-			// Flush response and release session
-			writer.Flush()
 			manager.ReleaseSession(s)
 		})
 	}

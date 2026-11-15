@@ -1,9 +1,13 @@
 package middleware
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -13,6 +17,8 @@ import (
 type memoryDriver struct {
 	mu        sync.Mutex
 	data      map[string]string
+	writes    int
+	touches   int
 	failWrite bool
 }
 
@@ -44,6 +50,7 @@ func (d *memoryDriver) Touch(id string) (bool, error) {
 	if _, ok := d.data[id]; !ok {
 		return false, nil
 	}
+	d.touches++
 	return true, nil
 }
 
@@ -64,10 +71,30 @@ func (d *memoryDriver) Write(id string, data string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.data[id] = data
+	d.writes++
 	return nil
 }
 
+func (d *memoryDriver) has(id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.data[id]
+	return ok
+}
+
+// ops returns the number of Write and Touch calls so far.
+func (d *memoryDriver) ops() (writes, touches int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.writes, d.touches
+}
+
 func buildManagerWithDriver(t *testing.T, driver *memoryDriver) *sessions.Manager {
+	t.Helper()
+	return buildManagerWithLogger(t, driver, nil)
+}
+
+func buildManagerWithLogger(t *testing.T, driver *memoryDriver, logger *slog.Logger) *sessions.Manager {
 	t.Helper()
 
 	manager, err := sessions.NewManager(&sessions.ManagerOptions{
@@ -75,14 +102,48 @@ func buildManagerWithDriver(t *testing.T, driver *memoryDriver) *sessions.Manage
 		Lifetime:             10,
 		GcInterval:           10,
 		DisableDefaultDriver: true,
+		Logger:               logger,
 	})
 	if err != nil {
 		t.Fatalf("NewManager failed: %v", err)
 	}
+	t.Cleanup(func() { _ = manager.Close() })
 	if err = manager.Extend("mock", driver); err != nil {
 		t.Fatalf("Extend failed: %v", err)
 	}
 	return manager
+}
+
+// sessionCookie returns the session cookie of a response, failing unless it
+// was sent exactly once.
+func sessionCookie(t *testing.T, header http.Header) *http.Cookie {
+	t.Helper()
+
+	cookies := (&http.Response{Header: header}).Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("got %d session cookies, want exactly 1", len(cookies))
+	}
+	return cookies[0]
+}
+
+// sessionValue reads a key the way a follow-up request carrying the cookie
+// would see it.
+func sessionValue(t *testing.T, manager *sessions.Manager, cookie *http.Cookie, key string) any {
+	t.Helper()
+
+	var got any
+	handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, err := manager.GetSession(r)
+		if err != nil {
+			t.Errorf("GetSession failed: %v", err)
+			return
+		}
+		got = s.Get(key)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(cookie)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	return got
 }
 
 func TestStartSessionSetsCookieWhenSaveSucceeds(t *testing.T) {
@@ -107,7 +168,8 @@ func TestStartSessionSetsCookieWhenSaveSucceeds(t *testing.T) {
 }
 
 func TestStartSessionSkipsCookieWhenSaveFails(t *testing.T) {
-	manager := buildManagerWithDriver(t, newMemoryDriver(true))
+	var logs bytes.Buffer
+	manager := buildManagerWithLogger(t, newMemoryDriver(true), slog.New(slog.NewTextHandler(&logs, nil)))
 	handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, err := manager.GetSession(r)
 		if err != nil {
@@ -116,6 +178,7 @@ func TestStartSessionSkipsCookieWhenSaveFails(t *testing.T) {
 		}
 		s.Put("k", "v")
 		_, _ = w.Write([]byte("ok"))
+		s.Put("late", "change")
 	}))
 
 	rr := httptest.NewRecorder()
@@ -124,6 +187,12 @@ func TestStartSessionSkipsCookieWhenSaveFails(t *testing.T) {
 
 	if len(rr.Result().Cookies()) != 0 {
 		t.Fatal("did not expect Set-Cookie header when save fails")
+	}
+	if rr.Body.String() != "ok" {
+		t.Fatalf("body = %q, the response must still go out", rr.Body.String())
+	}
+	if got := strings.Count(logs.String(), "session save failed"); got != 1 {
+		t.Fatalf("save failure logged %d times, want 1", got)
 	}
 }
 
@@ -149,44 +218,254 @@ func TestStartSessionStreamingDoesNotDuplicateBody(t *testing.T) {
 	}
 }
 
-func TestStartSessionPersistsChangesMadeAfterStreamingStarted(t *testing.T) {
-	driver := newMemoryDriver(false)
-	manager := buildManagerWithDriver(t, driver)
+// firstWrites are the calls that send the response header.
+var firstWrites = map[string]func(w http.ResponseWriter){
+	"WriteHeader": func(w http.ResponseWriter) { w.WriteHeader(http.StatusAccepted) },
+	"Write":       func(w http.ResponseWriter) { _, _ = w.Write([]byte("body")) },
+	"Flush":       func(w http.ResponseWriter) { w.(http.Flusher).Flush() },
+	"ReadFrom":    func(w http.ResponseWriter) { _, _ = w.(io.ReaderFrom).ReadFrom(strings.NewReader("body")) },
+}
+
+func TestStartSessionSavesBeforeHeaderIsSent(t *testing.T) {
+	for name, write := range firstWrites {
+		t.Run(name, func(t *testing.T) {
+			manager := buildManagerWithDriver(t, newMemoryDriver(false))
+			handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s, err := manager.GetSession(r)
+				if err != nil {
+					t.Errorf("GetSession failed: %v", err)
+					return
+				}
+				s.Put("user_id", 7)
+				write(w)
+
+				// Still inside the handler: a client that already got the
+				// header must find the session in the store.
+				if got := sessionValue(t, manager, sessionCookie(t, w.Header()), "user_id"); got != 7 {
+					t.Errorf("session not stored before the header went out, got %v", got)
+				}
+			}))
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+			sessionCookie(t, rr.Result().Header)
+		})
+	}
+}
+
+func TestStartSessionPersistsChangesMadeAfterHeaderSent(t *testing.T) {
+	for name, write := range firstWrites {
+		t.Run(name, func(t *testing.T) {
+			manager := buildManagerWithDriver(t, newMemoryDriver(false))
+			var id string
+			handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s, err := manager.GetSession(r)
+				if err != nil {
+					t.Errorf("GetSession failed: %v", err)
+					return
+				}
+				id = s.GetID()
+				write(w)                // session is saved here, cookie fixed
+				s.Put("late", "change") // after the header went out
+			}))
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+
+			cookie := sessionCookie(t, rr.Result().Header)
+			if cookie.Value != id {
+				t.Fatalf("cookie carries %s, want the session ID %s", cookie.Value, id)
+			}
+			if got := sessionValue(t, manager, cookie, "late"); got != "change" {
+				t.Fatalf("late session change was not persisted, got %v", got)
+			}
+		})
+	}
+}
+
+func TestStartSessionRegenerateAfterHeaderSentKeepsClientID(t *testing.T) {
+	var logs bytes.Buffer
+	d := newMemoryDriver(false)
+	manager := buildManagerWithLogger(t, d, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	seed := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		s.Put("user", "someone")
+	}))
+	rr := httptest.NewRecorder()
+	seed.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	cookie := sessionCookie(t, rr.Result().Header)
+
+	var lateID string
 	handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("streaming"))
-		w.(http.Flusher).Flush() // session is saved here, cookie fixed
-		s, err := manager.GetSession(r)
-		if err != nil {
-			t.Errorf("GetSession failed: %v", err)
-			return
+		s, _ := manager.GetSession(r)
+		_, _ = w.Write([]byte("body"))
+		if err := s.Regenerate(true); err != nil {
+			t.Errorf("Regenerate failed: %v", err)
 		}
-		s.Put("late", "change") // after the header went out
+		s.Put("user_id", 7)
+		lateID = s.GetID()
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(cookie)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// The header was gone before the ID changed: the client keeps the ID it
+	// came with, and the one it can never learn is not stored.
+	if got := sessionCookie(t, rr.Result().Header).Value; got != cookie.Value {
+		t.Fatalf("cookie carries %s, want the ID sent with the header %s", got, cookie.Value)
+	}
+	if d.has(lateID) {
+		t.Fatal("a session ID the client never received was stored")
+	}
+	if d.has(cookie.Value) {
+		t.Fatal("Regenerate(true) must still destroy the previous session")
+	}
+	if !strings.Contains(logs.String(), "session ID changed after the response header was sent") {
+		t.Fatalf("expected the late ID change to be logged, got %q", logs.String())
+	}
+}
+
+func TestStartSessionRegenerateBeforeHeaderSendsNewID(t *testing.T) {
+	d := newMemoryDriver(false)
+	manager := buildManagerWithDriver(t, d)
+
+	seed := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		s.Put("key", "kept")
+	}))
+	rr := httptest.NewRecorder()
+	seed.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	anonymous := sessionCookie(t, rr.Result().Header)
+
+	// Login: new ID first, then the response.
+	login := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		if err := s.Regenerate(true); err != nil {
+			t.Errorf("Regenerate failed: %v", err)
+		}
+		s.Put("user_id", 7)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(anonymous)
+	rr = httptest.NewRecorder()
+	login.ServeHTTP(rr, req)
+	loggedIn := sessionCookie(t, rr.Result().Header)
+
+	if loggedIn.Value == anonymous.Value {
+		t.Fatal("cookie still carries the pre-login session ID")
+	}
+	if d.has(anonymous.Value) {
+		t.Fatal("pre-login session was not destroyed")
+	}
+	if got := sessionValue(t, manager, loggedIn, "user_id"); got != 7 {
+		t.Fatalf("user_id = %v, want 7", got)
+	}
+	if got := sessionValue(t, manager, loggedIn, "key"); got != "kept" {
+		t.Fatalf("Regenerate dropped existing data, key = %v", got)
+	}
+	if got := sessionValue(t, manager, anonymous, "user_id"); got != nil {
+		t.Fatalf("pre-login session ID still resolves to a logged-in session: %v", got)
+	}
+
+	// Logout: Invalidate first, then the response.
+	logout := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		if err := s.Invalidate(); err != nil {
+			t.Errorf("Invalidate failed: %v", err)
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(loggedIn)
+	rr = httptest.NewRecorder()
+	logout.ServeHTTP(rr, req)
+	loggedOut := sessionCookie(t, rr.Result().Header)
+
+	if loggedOut.Value == loggedIn.Value {
+		t.Fatal("cookie still carries the logged-in session ID")
+	}
+	if d.has(loggedIn.Value) {
+		t.Fatal("logged-in session was not destroyed")
+	}
+	if got := sessionValue(t, manager, loggedOut, "user_id"); got != nil {
+		t.Fatalf("user_id survived Invalidate: %v", got)
+	}
+}
+
+func TestStartSessionTouchesStoreOncePerRequest(t *testing.T) {
+	d := newMemoryDriver(false)
+	manager := buildManagerWithDriver(t, d)
+	handler := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("one"))
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("two"))
 	}))
 
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
-
-	cookies := rr.Result().Cookies()
-	if len(cookies) == 0 {
-		t.Fatal("expected session cookie")
+	if writes, touches := d.ops(); writes != 1 || touches != 0 {
+		t.Fatalf("new session: writes=%d touches=%d, want 1 and 0", writes, touches)
 	}
 
-	// A follow-up request must see the late change.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.AddCookie(cookies[0])
-	var got any
-	verify := StartSession(manager, "mock")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s, err := manager.GetSession(r)
-		if err != nil {
-			t.Errorf("GetSession failed: %v", err)
-			return
-		}
-		got = s.Get("late")
-	}))
-	verify.ServeHTTP(httptest.NewRecorder(), req)
+	req.AddCookie(sessionCookie(t, rr.Result().Header))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if writes, touches := d.ops(); writes != 1 || touches != 1 {
+		t.Fatalf("unchanged session: writes=%d touches=%d, want 1 and 1", writes, touches)
+	}
+}
 
-	if got != "change" {
-		t.Fatalf("late session change was not persisted, got %v", got)
+func TestStartSessionHandlerPanic(t *testing.T) {
+	d := newMemoryDriver(false)
+	manager := buildManagerWithDriver(t, d)
+
+	serve := func(handler http.HandlerFunc) (rr *httptest.ResponseRecorder, recovered any) {
+		rr = httptest.NewRecorder()
+		defer func() { recovered = recover() }()
+		StartSession(manager, "mock")(handler).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		return rr, nil
+	}
+
+	// Nothing written yet: the panic passes through, nothing is sent or stored.
+	rr, recovered := serve(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		s.Put("k", "v")
+		panic("boom")
+	})
+	if recovered != "boom" {
+		t.Fatalf("recovered %v, want the handler's panic", recovered)
+	}
+	if rr.Body.Len() != 0 || len(rr.Result().Cookies()) != 0 {
+		t.Fatalf("response touched before the panic: body=%q cookies=%v", rr.Body.String(), rr.Result().Cookies())
+	}
+	if writes, _ := d.ops(); writes != 0 {
+		t.Fatalf("session stored %d times, want 0", writes)
+	}
+
+	// Already streaming: what was written stays written, and so does the
+	// session as it was when the header went out.
+	rr, recovered = serve(func(w http.ResponseWriter, r *http.Request) {
+		s, _ := manager.GetSession(r)
+		s.Put("before", "header")
+		_, _ = w.Write([]byte("partial"))
+		s.Put("after", "header")
+		panic(http.ErrAbortHandler)
+	})
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("recovered %v, want http.ErrAbortHandler", recovered)
+	}
+	if rr.Body.String() != "partial" {
+		t.Fatalf("body = %q, want the bytes written before the panic", rr.Body.String())
+	}
+	cookie := sessionCookie(t, rr.Result().Header)
+	if got := sessionValue(t, manager, cookie, "before"); got != "header" {
+		t.Fatalf("change made before the header was lost, got %v", got)
+	}
+	if got := sessionValue(t, manager, cookie, "after"); got != nil {
+		t.Fatalf("change made after the header was stored despite the panic: %v", got)
 	}
 }
 

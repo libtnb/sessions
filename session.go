@@ -207,16 +207,22 @@ func (s *Session) Remove(key string) any {
 // Concurrent saves of the same session ID are merged key by key: only the
 // keys written or forgotten during this request are applied on top of the
 // latest stored state.
+//
+// Flash data is aged in the stored copy only and the session itself is left
+// as it is, so Save may run more than once per request (before the response
+// header goes out, and again for changes made afterwards) without aging it
+// twice.
 func (s *Session) Save() error {
-	s.ageFlashData()
-
 	// Hold the per-session lock only while reading and writing the store.
 	if s.manager != nil {
 		s.manager.LockSession(s.GetID())
 		defer s.manager.UnlockSession(s.GetID())
 	}
 
-	if !s.dirty {
+	oldFlash, newFlash := s.flashKeys(flashOldKey), s.flashKeys(flashNewKey)
+	aging := len(oldFlash) > 0 || len(newFlash) > 0
+
+	if !s.dirty && !aging {
 		// No changes: refresh the store timestamp so GC keeps the active
 		// session alive.
 		found, err := s.driver.Touch(s.GetID())
@@ -243,6 +249,9 @@ func (s *Session) Save() error {
 	if s.flushed {
 		// Flush or Regenerate was called; use the current state as-is.
 		final = s.attributes
+		if aging {
+			final = stdmaps.Clone(final)
+		}
 	} else {
 		// Merge this request's changes on top of the latest stored state.
 		latest, err := s.readFromHandler()
@@ -263,6 +272,21 @@ func (s *Session) Save() error {
 		}
 		stdmaps.Copy(latest, s.puts)
 		final = latest
+	}
+
+	if aging {
+		// Keep may have revived a key that an earlier Save of this request
+		// already dropped from the store.
+		for _, key := range newFlash {
+			if value, ok := s.attributes[key]; ok {
+				final[key] = value
+			}
+		}
+		for _, key := range oldFlash {
+			delete(final, key)
+		}
+		final[flashOldKey] = flashList(newFlash)
+		final[flashNewKey] = flashList(nil)
 	}
 
 	data, err := s.codec.Encode(s.GetName(), final)
@@ -383,22 +407,6 @@ func (s *Session) readFromHandler() (map[string]any, error) {
 	return data, nil
 }
 
-func (s *Session) ageFlashData() {
-	old := s.flashKeys(flashOldKey)
-	newFlash := s.flashKeys(flashNewKey)
-
-	if len(old) == 0 && len(newFlash) == 0 {
-		return
-	}
-
-	if len(old) > 0 {
-		s.Forget(old...)
-	}
-
-	s.putFlashKeys(flashOldKey, newFlash)
-	s.putFlashKeys(flashNewKey, nil)
-}
-
 func (s *Session) mergeNewFlashes(keys ...string) {
 	values := s.flashKeys(flashNewKey)
 	for _, key := range keys {
@@ -439,13 +447,17 @@ func (s *Session) flashKeys(key string) []string {
 	}
 }
 
-// putFlashKeys stores a flash key list as []any, the canonical on-disk form.
 func (s *Session) putFlashKeys(key string, keys []string) {
+	s.Put(key, flashList(keys))
+}
+
+// flashList converts a flash key list to []any, the canonical on-disk form.
+func flashList(keys []string) []any {
 	values := make([]any, len(keys))
 	for i, k := range keys {
 		values[i] = k
 	}
-	s.Put(key, values)
+	return values
 }
 
 // maxRetainedEntries caps the map capacity kept by pooled sessions; larger
